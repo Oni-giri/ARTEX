@@ -1,43 +1,171 @@
 name: Publish Docker Image
 
+# Publishes ghcr.io/<owner>/artex for the Umbrel package in
+# Oni-giri/yakitoris-app-store (yakitori-artex).
+#
+# Trigger it by pushing a tag, or by hand:
+#   Actions -> "Publish Docker Image" -> Run workflow -> version: v0.6.0-umbrel.1
+#
+# amd64 is built natively on the runner. arm64 needs its own native runner
+# (ubuntu-24.04-arm) — building it under QEMU here would take hours, so the
+# arm64 job is opt-in through the `arm64` input.
+
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      version:
+        description: Image tag to publish (also pushed as :latest)
+        required: true
+        default: v0.6.0-umbrel.1
+      arm64:
+        description: Also build linux/arm64 (slow, native arm runner)
+        type: boolean
+        default: false
 
 permissions:
-  contents: write
+  contents: read
   packages: write
 
+concurrency:
+  group: ghcr-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  docker:
+  amd64:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      # The image carries Chromium, Node, bbot and the recon toolbox; the build
+      # needs far more disk than a stock runner has.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: false
+          swap-storage: false
+
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve version
+        id: v
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            echo "tag=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/build-push-action@v6
+        id: build
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          # A plain image manifest: attestation/SBOM manifests confuse older
+          # Docker clients (umbrelOS pulls with docker-modem).
+          provenance: false
+          sbom: false
+          build-args: |
+            ARTEX_VERSION=${{ steps.v.outputs.tag }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.v.outputs.tag }}
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/artex:${{ steps.v.outputs.tag }}
+            ghcr.io/${{ github.repository_owner }}/artex:latest
+
+      - name: Summary
+        run: |
+          {
+            echo "### Published"
+            echo ""
+            echo "- tag: \`${{ steps.v.outputs.tag }}\` (+ \`latest\`)"
+            echo "- digest: \`${{ steps.build.outputs.digest }}\`"
+            echo ""
+            echo "Pin that digest in yakitori-artex/docker-compose.yml."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  arm64:
+    if: ${{ inputs.arm64 }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 360
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: false
+          swap-storage: false
+
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve version
+        id: v
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            echo "tag=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/build-push-action@v6
+        id: build
+        with:
+          context: .
+          platforms: linux/arm64
+          push: true
+          provenance: false
+          sbom: false
+          build-args: |
+            ARTEX_VERSION=${{ steps.v.outputs.tag }}
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/artex:${{ steps.v.outputs.tag }}-arm64
+
+  # Merge the per-arch images into one multi-arch tag.
+  manifest:
+    needs: [amd64, arm64]
+    if: ${{ inputs.arm64 }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          build-args: ARTEX_VERSION=${{ github.ref_name }}
-          tags: |
-            ghcr.io/${{ github.repository_owner }}/artex:${{ github.ref_name }}
-            ghcr.io/${{ github.repository_owner }}/artex:latest
-
-  release:
-    needs: docker
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/')
-        with:
-          generate_release_notes: true
+      - name: Resolve version
+        id: v
+        run: echo "tag=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+      - name: Merge manifests
+        run: |
+          docker buildx imagetools create \
+            -t ghcr.io/${{ github.repository_owner }}/artex:${{ steps.v.outputs.tag }} \
+            -t ghcr.io/${{ github.repository_owner }}/artex:latest \
+            ghcr.io/${{ github.repository_owner }}/artex:${{ steps.v.outputs.tag }} \
+            ghcr.io/${{ github.repository_owner }}/artex:${{ steps.v.outputs.tag }}-arm64
